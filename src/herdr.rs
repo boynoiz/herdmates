@@ -35,6 +35,25 @@ pub enum HerdrError {
     InvalidResponse { argv: String, message: String },
 }
 
+/// `herdr pane process-info`'s answer, narrowed to the job question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PaneProcessInfo {
+    pub foreground_process_group_id: i64,
+    pub shell_pid: i64,
+}
+
+impl PaneProcessInfo {
+    /// Is something running in the pane beyond its shell sitting at a prompt?
+    ///
+    /// An idle shell is its own foreground process group; starting a job makes
+    /// the terminal's foreground group that job's instead. Live-verified on
+    /// herdr 0.7.5: idle fish reports both equal, a pane running a teammate
+    /// reports them different.
+    pub fn job_running(&self) -> bool {
+        self.foreground_process_group_id != self.shell_pid
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
     pub binary: PathBuf,
@@ -227,6 +246,20 @@ pub trait HerdrApi {
     fn pane_read(&self, _: &str) -> Result<String, HerdrError> {
         Err(unsupported_api())
     }
+    /// `pane process-info --pane <id>`: what is actually executing in the
+    /// pane. The one spawn signal herdr offers that pane text cannot fake —
+    /// `pane run` bytes render on arrival whether or not a shell read them,
+    /// but a process group only exists if something really ran.
+    fn pane_process_info(&self, _: &str) -> Result<PaneProcessInfo, HerdrError> {
+        Err(unsupported_api())
+    }
+    /// `pane read --source recent-unwrapped`: the same scrollback without the
+    /// terminal's soft line breaks. A wrapped read splits long lines at the
+    /// pane width, so a command line that wrapped can no longer be found by
+    /// substring — which is exactly what checking for a shell's echo needs.
+    fn pane_read_unwrapped(&self, _: &str) -> Result<String, HerdrError> {
+        Err(unsupported_api())
+    }
     fn pane_rename(&self, _: &str, _: &str) -> Result<(), HerdrError> {
         Err(unsupported_api())
     }
@@ -412,6 +445,24 @@ impl HerdrClient {
 
     pub fn pane_read(&self, pane_id: &str) -> Result<String, HerdrError> {
         let args = args(["pane", "read"]).with(pane_id).finish();
+        self.invoke(&args)
+    }
+
+    pub fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let args = args(["pane", "process-info"])
+            .with("--pane")
+            .with(pane_id)
+            .finish();
+        let stdout = self.invoke(&args)?;
+        parse_pane_process_info(&stdout).map_err(|message| self.invalid_response(&args, message))
+    }
+
+    pub fn pane_read_unwrapped(&self, pane_id: &str) -> Result<String, HerdrError> {
+        let args = args(["pane", "read"])
+            .with(pane_id)
+            .with("--source")
+            .with("recent-unwrapped")
+            .finish();
         self.invoke(&args)
     }
 
@@ -652,6 +703,12 @@ impl HerdrApi for HerdrClient {
     fn pane_read(&self, pane_id: &str) -> Result<String, HerdrError> {
         Self::pane_read(self, pane_id)
     }
+    fn pane_read_unwrapped(&self, pane_id: &str) -> Result<String, HerdrError> {
+        Self::pane_read_unwrapped(self, pane_id)
+    }
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        Self::pane_process_info(self, pane_id)
+    }
     fn pane_rename(&self, pane_id: &str, title: &str) -> Result<(), HerdrError> {
         Self::pane_rename(self, pane_id, title)
     }
@@ -812,6 +869,17 @@ pub(crate) mod test_support {
         pub fail_layout: SyncCell<bool>,
         pub agents: SyncRefCell<Vec<AgentInfo>>,
         pub waits: SyncRefCell<VecDeque<WaitOutcome>>,
+        /// Successive `pane_read_unwrapped` responses. Once exhausted the
+        /// last one repeats, so a queue ending in a steady value models a
+        /// terminal that has finished drawing and gone quiet.
+        pub pane_reads: SyncRefCell<VecDeque<String>>,
+        pub last_pane_read: SyncRefCell<String>,
+        /// A pane whose output never stops changing, however long it is
+        /// watched — the shell that never reaches a prompt.
+        pub pane_never_settles: SyncCell<bool>,
+        /// The pane still sits at its prompt after the command was submitted:
+        /// nothing ever ran.
+        pub pane_idle_after_submit: SyncCell<bool>,
     }
 
     impl FakeHerdr {
@@ -962,6 +1030,47 @@ pub(crate) mod test_support {
         fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
             self.calls.borrow_mut().push("agent_list".to_owned());
             Ok(self.agents.borrow().clone())
+        }
+        fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_process_info:{pane_id}"));
+            let shell_pid = 4242;
+            Ok(PaneProcessInfo {
+                shell_pid,
+                foreground_process_group_id: if self.pane_idle_after_submit.get() {
+                    shell_pid
+                } else {
+                    shell_pid + 1
+                },
+            })
+        }
+        fn pane_read_unwrapped(&self, pane_id: &str) -> Result<String, HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_read_unwrapped:{pane_id}"));
+            if self.pane_never_settles.get() {
+                let reads = self
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with("pane_read_unwrapped:"))
+                    .count();
+                return Ok(format!("still drawing {reads}"));
+            }
+            if let Some(next) = self.pane_reads.borrow_mut().pop_front() {
+                *self.last_pane_read.borrow_mut() = next.clone();
+                return Ok(next);
+            }
+            // An exhausted queue reads as a pane that has finished drawing and
+            // gone quiet — the ordinary case, so tests that do not care about
+            // startup timing are not made to wait one out.
+            let last = self.last_pane_read.borrow().clone();
+            Ok(if last.is_empty() {
+                "$ ".to_owned()
+            } else {
+                last
+            })
         }
         fn workspace_focus(&self, workspace_id: &str) -> Result<(), HerdrError> {
             self.calls
@@ -1411,6 +1520,19 @@ struct PaneLayoutResult {
     #[serde(rename = "type")]
     kind: String,
     layout: PaneLayoutSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneProcessInfoResult {
+    #[serde(rename = "type")]
+    kind: String,
+    process_info: PaneProcessInfo,
+}
+
+fn parse_pane_process_info(stdout: &str) -> Result<PaneProcessInfo, String> {
+    let result: PaneProcessInfoResult = parse_response(stdout)?;
+    expect_kind(&result.kind, "pane_process_info")?;
+    Ok(result.process_info)
 }
 
 fn parse_pane_layout(stdout: &str) -> Result<PaneLayoutSnapshot, String> {
