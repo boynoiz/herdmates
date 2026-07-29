@@ -457,7 +457,7 @@ impl HerdrClient {
         let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)).to_string();
         let args = args(["agent", "wait"])
             .with(pane_id)
-            .with("--status")
+            .with("--until")
             .with(status)
             .with("--timeout")
             .with(timeout_ms)
@@ -1471,10 +1471,15 @@ mod tests {
             let response = directory.join("response");
             fs::write(&response, stdout).expect("write fake Herdr response");
             let path = directory.join("herdr");
+            let argv_log = directory.join("argv");
             let staging_path = directory.join("herdr.staging");
             fs::write(
                 &staging_path,
-                format!("#!/bin/sh\ncat '{}'\n", response.display()),
+                format!(
+                    "#!/bin/sh\n: > '{argv}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{argv}'; done\ncat '{response}'\n",
+                    argv = argv_log.display(),
+                    response = response.display()
+                ),
             )
             .expect("write fake Herdr executable");
             let mut permissions = fs::metadata(&staging_path)
@@ -1510,6 +1515,17 @@ mod tests {
             HerdrClient {
                 binary: self.path.clone(),
             }
+        }
+
+        /// The argv of the most recent invocation — the only way to catch
+        /// drift between the flags this crate sends and the ones the real
+        /// herdr CLI accepts, which no `FakeHerdr` test can see.
+        fn argv(&self) -> Vec<String> {
+            fs::read_to_string(self._directory.join("argv"))
+                .expect("fake Herdr records its argv")
+                .lines()
+                .map(str::to_owned)
+                .collect()
         }
     }
 
@@ -1650,6 +1666,31 @@ mod tests {
             .client()
             .pane_rename("opaque-pane", "worker")
             .expect("pane_info is the live successful rename response");
+    }
+
+    #[test]
+    fn agent_wait_names_the_status_with_herdrs_until_flag() {
+        // `herdr agent wait --help`: the status selector is `--until`, and an
+        // unknown option exits 2 — which `agent_wait` cannot distinguish from
+        // a real failure, so every verify path silently degrades into an
+        // error instead of a wait.
+        let binary = FakeBinary::returning(
+            r#"{"event":"pane.agent_status_changed","data":{"pane_id":"opaque-pane","agent_status":"idle"}}"#,
+        );
+        binary
+            .client()
+            .agent_wait("opaque-pane", "idle", Duration::from_secs(1))
+            .expect("status event is a successful wait match");
+
+        let argv = binary.argv();
+        assert!(
+            argv.iter().any(|arg| arg == "--until"),
+            "herdr takes --until, sent: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "--status"),
+            "--status is not a herdr flag, sent: {argv:?}"
+        );
     }
 
     #[test]
