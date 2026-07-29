@@ -75,6 +75,7 @@
 
 use crate::herdr::HerdrApi;
 use crate::idmap::IdMap;
+use crate::panesubmit::{job_started, wait_until_quiet, SubmitPolicy};
 use crate::tmuxargs::{self, DisplayField, ParseError, TmuxId, Verb};
 use std::process::ExitCode;
 
@@ -184,22 +185,71 @@ fn styling_noop(call: String) -> DispatchOutcome {
 /// already-split pane, via `herdr pane run` (closest herdr match — herdr has
 /// no separate "respawn the pane's process" primitive; `pane run` submits
 /// `CMD` to the pane the same way a human typing it would).
+///
+/// Because it *is* typing, a bare `pane run` proves only that herdr accepted
+/// the keystrokes. The pane was split moments earlier and comes up running the
+/// user's login shell; anything typed before that shell's readline is up dies
+/// in its init (a slow interactive prompt — VCS/cloud segments, greetings —
+/// widens the window to whole seconds). The teammate then never launches, the
+/// pane idles at a prompt, and an unverified `Ok` here reports a successful
+/// spawn to the caller. So submission is verified, per the ADR-0008 launcher
+/// policy `spawn.rs` already applies to its own launches.
 fn respawn_pane<H: HerdrApi>(
     herdr: &H,
     idmap: &IdMap,
     pane: &TmuxId,
     command: &str,
 ) -> DispatchOutcome {
+    respawn_pane_with(herdr, idmap, pane, command, SubmitPolicy::default())
+}
+
+/// [`respawn_pane`] with its waits injectable, so tests exercise the real
+/// control flow without paying the production clock.
+fn respawn_pane_with<H: HerdrApi>(
+    herdr: &H,
+    idmap: &IdMap,
+    pane: &TmuxId,
+    command: &str,
+    policy: SubmitPolicy,
+) -> DispatchOutcome {
     let herdr_pane_id = match idmap.lookup(pane.as_str()) {
         Some(id) => id.to_owned(),
         None => return unknown_tmux_id("respawn-pane", pane.as_str()),
     };
-    match herdr.pane_run(&herdr_pane_id, command) {
-        Ok(()) => DispatchOutcome::Ok {
+
+    // Wait for the pane's shell to reach its prompt before typing at it.
+    // `pane run` writes bytes straight to the pty: a shell still running its
+    // init never reads them, and its own redraw wipes them off the screen, so
+    // the command is silently lost. Waiting cannot be replaced by checking the
+    // pane afterwards — herdr's terminal renders those bytes on arrival, so
+    // the command appears in `pane read` whether or not any shell took it.
+    wait_until_quiet(herdr, &herdr_pane_id, policy);
+
+    if let Err(error) = herdr.pane_run(&herdr_pane_id, command) {
+        return DispatchOutcome::Error {
+            message: format!("teammux: respawn-pane: herdr pane run failed: {error}"),
+        };
+    }
+    // Verified by what is executing, not by what the pane shows. Two signals
+    // that look plausible here are both useless: herdr's agent detection reads
+    // the terminal title, and a Claude Code teammate sets a different one than
+    // a plain session (live-checked — a healthy teammate reports `agent: null`
+    // and `agent explain` answers `agent_not_found`), while the pane's text
+    // shows the command whether or not a shell ran it, because herdr renders
+    // `pane run`'s bytes on arrival. A foreground process group only exists if
+    // something really started.
+    match job_started(herdr, &herdr_pane_id, policy) {
+        Ok(true) => DispatchOutcome::Ok {
             stdout: String::new(),
         },
+        Ok(false) => DispatchOutcome::Error {
+            message: format!(
+                "teammux: respawn-pane: no process started in pane {herdr_pane_id} \
+                 after running `{command}` — the pane is still at its shell prompt"
+            ),
+        },
         Err(error) => DispatchOutcome::Error {
-            message: format!("teammux: respawn-pane: herdr pane run failed: {error}"),
+            message: format!("teammux: respawn-pane: herdr pane process-info failed: {error}"),
         },
     }
 }
@@ -595,10 +645,12 @@ mod tests {
     use crate::herdr::test_support::FakeHerdr;
     use crate::herdr::{PaneInfo, PaneLayoutPane, PaneLayoutRect, PaneLayoutSnapshot};
     use crate::tmuxargs::GlobalFlags;
+    use std::collections::VecDeque;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -625,6 +677,18 @@ mod tests {
         tmuxargs::ParsedCall {
             globals: GlobalFlags::default(),
             verb,
+        }
+    }
+
+    /// The production policy's real waits are seconds long; tests drive the
+    /// same code with the clock wound down so a "shell never listened" case
+    /// costs milliseconds rather than a quarter of a minute.
+    fn fast_policy() -> SubmitPolicy {
+        SubmitPolicy {
+            settle_timeout: Duration::from_millis(20),
+            poll_interval: Duration::from_millis(1),
+            quiet_reads: 2,
+            job_timeout: Duration::from_millis(20),
         }
     }
 
@@ -1192,6 +1256,7 @@ mod tests {
     fn respawn_pane_submits_the_command_via_pane_run() {
         let idmap = temp_idmap(&[("%1", "w1A:p6")]);
         let fake = FakeHerdr::default();
+        *fake.pane_reads.borrow_mut() = VecDeque::from(["$ ".to_owned()]);
 
         let outcome = dispatch(
             &fake,
@@ -1211,6 +1276,160 @@ mod tests {
             .calls()
             .iter()
             .any(|call| call == "pane_run:w1A:p6:cd /tmp && claude"));
+    }
+
+    #[test]
+    fn respawn_pane_waits_for_the_shell_to_stop_drawing_before_typing() {
+        // The live bug: `pane run` immediately after `pane split` is written
+        // to a pty whose shell is still running its init, which never reads
+        // it — reproduced standalone with `echo MARKER > file`, which never
+        // ran. Letting the terminal go quiet first made the same command run.
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        *fake.pane_reads.borrow_mut() = VecDeque::from([
+            String::new(),
+            "fish logo".to_owned(),
+            "fish logo\nWelcome to fish".to_owned(),
+            "fish logo\nWelcome to fish\n$ ".to_owned(),
+        ]);
+
+        let outcome = respawn_pane_with(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "claude",
+            fast_policy(),
+        );
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: String::new()
+            }
+        );
+        let calls = fake.calls();
+        let submit = calls
+            .iter()
+            .position(|call| call.starts_with("pane_run:"))
+            .expect("the command is still submitted");
+        let quiet_reads = calls[..submit]
+            .iter()
+            .filter(|call| call.starts_with("pane_read_unwrapped:"))
+            .count();
+        assert!(
+            quiet_reads >= 4,
+            "must watch the pane until it repeats itself, not type at once: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn respawn_pane_types_the_command_exactly_once() {
+        // Nothing verifies the submit afterwards — herdr's terminal renders
+        // `pane run` bytes on arrival, so the command shows up in `pane read`
+        // whether or not a shell read it — which makes a second speculative
+        // submit unjustifiable: it would land in the booting agent's composer.
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        *fake.pane_reads.borrow_mut() = VecDeque::from(["$ ".to_owned()]);
+
+        respawn_pane_with(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "claude",
+            fast_policy(),
+        );
+
+        let submits = fake
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "pane_run:w1A:p6:claude")
+            .count();
+        assert_eq!(submits, 1);
+    }
+
+    #[test]
+    fn respawn_pane_still_submits_when_the_pane_never_goes_quiet() {
+        // A pane that never stops changing may be an animated prompt rather
+        // than a broken shell. The wait is a courtesy, so it times out into
+        // the submit instead of failing a spawn that would have worked.
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        fake.pane_never_settles.set(true);
+
+        let outcome = respawn_pane_with(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "claude",
+            fast_policy(),
+        );
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: String::new()
+            }
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_run:w1A:p6:claude"));
+    }
+
+    #[test]
+    fn respawn_pane_fails_loudly_when_no_job_started_in_the_pane() {
+        // The whole point of the exercise: a spawn that did not spawn must not
+        // report success. `herdr pane process-info` answers this directly —
+        // a pane with a job running has a foreground process group distinct
+        // from its shell; an idle prompt has them equal. Unlike the pane's
+        // rendered text, that cannot be faked by bytes herdr wrote to the pty.
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        *fake.pane_reads.borrow_mut() = VecDeque::from(["$ ".to_owned()]);
+        fake.pane_idle_after_submit.set(true);
+
+        let outcome = respawn_pane_with(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "claude",
+            fast_policy(),
+        );
+
+        match outcome {
+            DispatchOutcome::Error { message } => assert!(
+                message.contains("no process started"),
+                "unhelpful message: {message}"
+            ),
+            other => panic!("expected an Error outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respawn_pane_succeeds_once_a_job_is_running_in_the_pane() {
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        *fake.pane_reads.borrow_mut() = VecDeque::from(["$ ".to_owned()]);
+
+        let outcome = respawn_pane_with(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "claude",
+            fast_policy(),
+        );
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: String::new()
+            }
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_process_info:w1A:p6"));
     }
 
     #[test]

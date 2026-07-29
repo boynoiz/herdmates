@@ -4,6 +4,7 @@
 use crate::agents_md::{render_agents_md, AgentsMdError};
 use crate::herdr::{HerdrApi, HerdrClient, HerdrError, PaneInfo, WaitOutcome};
 use crate::launcher::{launcher_entry, load_from_env, LauncherError};
+use crate::panesubmit;
 use crate::run::{create_run, load_run, RunBoard, RunError};
 use crate::spec::{
     load_team_spec, spawn_command as dry_run_command, team_spec_from_agents, validate_team_spec,
@@ -832,6 +833,12 @@ fn launch_worker<H: HerdrApi>(
         .as_ref()
         .is_some_and(|pane| pane.agent.is_some());
     if !agent_already_running {
+        // The pane was created moments ago and comes up running a login shell.
+        // `pane run` writes to the pty directly, so a command submitted before
+        // that shell reads input is discarded — the same race `teammux`'s
+        // `respawn-pane` hit, which leaves the worker sitting at a prompt while
+        // the startup wait below blames a slow agent.
+        panesubmit::wait_until_quiet(herdr, &pane_id, panesubmit::SubmitPolicy::default());
         herdr
             .pane_run(&pane_id, &shell_join(&launcher.command))
             .map_err(|source| worker_herdr(worker, "agent launch", source))?;
@@ -1656,6 +1663,17 @@ mod tests {
                 && call.contains("Read the generated team protocol at")
         }));
         assert!(calls.iter().any(|call| call == "agent_wait:pane-1:working"));
+        let launch = calls
+            .iter()
+            .position(|call| call == "pane_run:pane-1:'claude'")
+            .expect("the launcher command is submitted");
+        assert!(
+            calls[..launch]
+                .iter()
+                .any(|call| call.starts_with("pane_read_unwrapped:")),
+            "the launcher command must not be typed into a pane that is still \
+             starting its shell — same race as teammux respawn-pane: {calls:?}"
+        );
     }
 
     #[test]

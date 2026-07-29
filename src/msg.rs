@@ -5,6 +5,7 @@ use crate::herdr::{HerdrApi, HerdrClient, HerdrError, WaitOutcome};
 use crate::launcher::{
     conservative_adopted_launcher, launcher_entry, load_from_env, LauncherError,
 };
+use crate::panesubmit;
 use crate::run::{list_active_runs, load_run, update_run_with_hook, RunBoard, RunError};
 use crate::types::{LauncherEntry, LauncherTable, RunLifecycle};
 use std::collections::BTreeSet;
@@ -19,6 +20,14 @@ use thiserror::Error;
 const MSG_USAGE: &str =
     "usage: herdr-agent-team msg <target> <text> [--attention] [--ack] [--run <run-dir>]";
 const SUBMIT_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Settle budget before typing at a target. Short on purpose — see
+/// `deliver_message`.
+const SETTLE_POLICY: panesubmit::SubmitPolicy = panesubmit::SubmitPolicy {
+    settle_timeout: Duration::from_secs(3),
+    poll_interval: Duration::from_millis(200),
+    quiet_reads: 2,
+    job_timeout: Duration::from_secs(10),
+};
 const SUBMIT_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTBOX_DIR: &str = "outbox";
 const SEQUENCE_WIDTH: usize = 20;
@@ -499,6 +508,16 @@ fn deliver_message<H: HerdrApi>(
     text: &str,
     launcher: &LauncherEntry,
 ) -> Result<(), MsgError> {
+    // A target whose agent is still painting its first frame has not started
+    // reading the pty yet, and `pane run` writes to it regardless — the body is
+    // simply lost. The empty-`pane_run` retry further down cannot recover that:
+    // it resubmits an empty composer, which is the fix for a swallowed Enter on
+    // text that did arrive, not for text that never did.
+    //
+    // The budget is deliberately short. A target mid-turn animates and so never
+    // goes quiet, and messaging a busy worker is a supported case that must stay
+    // prompt — it pays this once and proceeds.
+    panesubmit::wait_until_quiet(herdr, &target.pane_id, SETTLE_POLICY);
     herdr.pane_run(&target.pane_id, text)?;
     if !launcher.submit_verify {
         return Ok(());
@@ -973,6 +992,33 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call, Call::PaneRun(_, text) if text == "ready")));
         }
+    }
+
+    #[test]
+    fn delivery_waits_for_the_target_ui_to_settle_before_typing() {
+        // `pane run` writes to the pty, so a body submitted while the target's
+        // agent is still painting its first frame is discarded outright — the
+        // empty-`pane_run` retry below cannot save it, because that resubmits an
+        // empty composer, not the lost text. Live-verified: a body sent 1s after
+        // an agent starts never appears; the same body after it settles does.
+        let temp = TempDir::new();
+        let run = fixture_run(temp.path(), "builder", "codex");
+        let herdr = fake_herdr("codex", Some("idle"), [WaitOutcome::Reached]);
+
+        send_message(&run, &conservative_table(), "builder", "hello", &herdr)
+            .expect("deliver to a settled target");
+
+        let calls = herdr.calls();
+        let submit = calls
+            .iter()
+            .position(|call| call == "pane_run:worker-pane:hello")
+            .expect("the body is submitted");
+        assert!(
+            calls[..submit]
+                .iter()
+                .any(|call| call.starts_with("pane_read_unwrapped:")),
+            "must not type into a target that may still be starting: {calls:?}"
+        );
     }
 
     #[test]
