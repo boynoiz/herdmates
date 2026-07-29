@@ -545,7 +545,7 @@ mod tests {
                     }
                     if let Some(rest) = call.strip_prefix("agent_wait:") {
                         let (pane, status) = rest.split_once(':').expect("agent wait call shape");
-                        return vec!["agent", "wait", pane, "--status", status]
+                        return vec!["agent", "wait", pane, "--until", status]
                             .into_iter()
                             .map(str::to_owned)
                             .collect();
